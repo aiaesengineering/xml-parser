@@ -394,6 +394,11 @@ st.markdown("""
 PROJECT_FOLDER = Path("project_reports")
 PROJECT_FOLDER.mkdir(exist_ok=True, parents=True)
 
+def list_existing_projects():
+    files = PROJECT_FOLDER.glob("*_clash_report.xlsx")
+    projects = [f.stem.replace("_clash_report", "") for f in files]
+    return sorted(projects)
+
 def normalize_project_name(raw: str) -> str:
     if not raw or not str(raw).strip():
         return "default_project"
@@ -529,6 +534,95 @@ def update_project_file(df_new, project_input, open_cnt, closed_cnt):
 
         status_summary = lower.value_counts().reset_index(name="Count").rename(columns={status_col: "Status"})
 
+
+
+        # ------------------------------
+        # Test Summary Sheet (NEW)
+        # ------------------------------
+
+        test_summary = None
+
+        if status_col:
+
+            df_test = combined_details.copy()
+
+            # Normalize status
+            df_test["Status"] = df_test[status_col].astype(str).str.lower()
+
+            # Create pivot for status counts
+            status_pivot = (
+                df_test.pivot_table(
+                    index=["Prefix", "Test Name"],
+                    columns="Status",
+                    aggfunc="size",
+                    fill_value=0
+                )
+                .reset_index()
+            )
+
+            # Ensure all required columns exist
+            for col in ["new", "active", "reviewed", "approved", "resolved"]:
+                if col not in status_pivot.columns:
+                    status_pivot[col] = 0
+
+            # Total clashes per test
+            total_clashes = (
+                df_test.groupby(["Prefix", "Test Name"])
+                .size()
+                .reset_index(name="Total Clashes")
+            )
+
+            # Priority per test (take first)
+            priority_map = (
+                df_test.groupby(["Prefix", "Test Name"])["Priority"]
+                .first()
+                .reset_index()
+            )
+
+            # Merge everything
+            test_summary = total_clashes.merge(status_pivot, on=["Prefix", "Test Name"])
+            test_summary = test_summary.merge(priority_map, on=["Prefix", "Test Name"])
+
+            # Rename columns properly
+            test_summary = test_summary.rename(columns={
+                "new": "New",
+                "active": "Active",
+                "reviewed": "Reviewed",
+                "approved": "Approved",
+                "resolved": "Resolved"
+            })
+
+            # # Final column order
+            # test_summary = test_summary[
+            #     ["Prefix", "Test Name", "Total Clashes",
+            #     "New", "Active", "Reviewed", "Approved", "Resolved", "Priority"]
+            # ]
+
+            # Add Open & Closed columns
+            test_summary["Open"] = (
+                test_summary["New"] +
+                test_summary["Active"] +
+                test_summary["Reviewed"]
+            )
+
+            test_summary["Closed"] = (
+                test_summary["Approved"] +
+                test_summary["Resolved"]
+            )
+
+            # Final order (UPDATED)
+            test_summary = test_summary[
+                ["Prefix", "Test Name", "Total Clashes",
+                "New", "Active", "Reviewed", "Approved", "Resolved",
+                "Open", "Closed",
+                "Priority"]
+            ]
+
+            # Sort nicely
+            test_summary = test_summary.sort_values("Total Clashes", ascending=False)
+
+
+
     # if "Prefix" in combined_details.columns:
     #     prefix_summary = combined_details["Prefix"].dropna().value_counts().reset_index(name="Clash Count")
 
@@ -580,6 +674,8 @@ def update_project_file(df_new, project_input, open_cnt, closed_cnt):
                 status_summary.to_excel(writer, sheet_name="Status_Summary", index=False)
             if prefix_summary is not None:
                 prefix_summary.to_excel(writer, sheet_name="Prefix_Summary", index=False)
+            if test_summary is not None:
+                test_summary.to_excel(writer, sheet_name="Test_Summary", index=False)
             weekly_df.to_excel(writer, sheet_name="Weekly_Progress", index=False)
 
         bytes_data = output.getvalue()
@@ -604,11 +700,35 @@ uploaded = st.file_uploader("Choose XML file", type=["xml"])
 
 if uploaded:
     st.write(f"File size: {uploaded.size / 1024 / 1024:.1f} MB")
-    project_input = st.text_input(
-        "2. Project name (same name = same file)",
-        value="MyProject",
-        help="Use the **same name every time**"
-    )
+    # Get existing projects
+    existing_projects = list_existing_projects()
+
+    st.subheader("2. Select or Enter Project")
+
+    col1, col2 = st.columns([2, 1])
+
+    with col1:
+        selected_project = st.selectbox(
+            "Choose existing project",
+            options=["-- Select Project --"] + existing_projects,
+            key="dashboard_project_select"
+        )
+
+    with col2:
+        project_input = st.text_input(
+            "Or enter new project",
+            value="",
+            key="xml_project_input"
+        )
+
+    # Final selection logic
+    if selected_project != "-- Select Project --":
+        project_input = selected_project
+
+    # Safety check
+    if not project_input:
+        st.warning("Please select or enter a project name.")
+        st.stop()
 
     computed_fn = get_project_filepath(project_input).name
     full_path = str(get_project_filepath(project_input).absolute())
@@ -722,7 +842,11 @@ if page == "Clash Dashboard":
 
     st.title("📊 Clash Coordination Dashboard")
 
-    project_input = st.text_input("Project name", value="MyProject")
+    # project_input = st.text_input("Project name", value="MyProject")
+
+    
+
+
 
     path = get_project_filepath(project_input)
 
@@ -917,3 +1041,137 @@ if page == "Clash Dashboard":
             )
 
             c3.plotly_chart(fig3, width="stretch")
+
+
+    
+
+    # ------------------------------
+    # Test Summary UI (NEW)
+    # ------------------------------
+
+    try:
+        test_df = pd.read_excel(path, sheet_name="Test_Summary")
+
+        if not test_df.empty:
+
+            st.divider()
+            st.subheader("📋 Test Summary")
+
+            # -------- Prefix Buttons --------
+            prefixes = sorted(test_df["Prefix"].dropna().unique().tolist())
+
+            cols = st.columns(len(prefixes) + 1)
+
+            selected_prefix = None
+
+            # "All" button
+            if cols[0].button("All"):
+                selected_prefix = "All"
+
+            # Prefix buttons
+            for i, p in enumerate(prefixes):
+                if cols[i + 1].button(p):
+                    selected_prefix = p
+
+            # Keep selection in session (important)
+            if "selected_prefix" not in st.session_state:
+                st.session_state.selected_prefix = "All"
+
+            if selected_prefix:
+                st.session_state.selected_prefix = selected_prefix
+
+            current_prefix = st.session_state.selected_prefix
+
+            # -------- Filtering --------
+            if current_prefix != "All":
+                filtered_df = test_df[test_df["Prefix"] == current_prefix]
+            else:
+                filtered_df = test_df.copy()
+
+            st.caption(f"Showing: {current_prefix}")
+
+            # -------- Display Table --------
+            st.dataframe(filtered_df, use_container_width=True)
+
+            # -------- XML Export --------
+            def convert_df_to_xml(df):
+                root = ET.Element("TestSummary")
+
+                for _, row in df.iterrows():
+                    test_el = ET.SubElement(root, "Test")
+
+                    for col in df.columns:
+                        child = ET.SubElement(test_el, col.replace(" ", "_"))
+                        child.text = str(row[col])
+
+                return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+            # xml_bytes = convert_df_to_xml(filtered_df)
+
+            # st.download_button(
+            #     label="⬇ Export Filtered as XML",
+            #     data=xml_bytes,
+            #     file_name=f"test_summary_{current_prefix}.xml",
+            #     mime="application/xml",
+            #     use_container_width=True
+            # )
+
+            # -------- Status Filter for Export --------
+            st.markdown("### Export Options")
+
+            c1, c2, c3 = st.columns(3)
+
+            export_open = c1.checkbox("Open Only")
+            export_closed = c2.checkbox("Closed Only")
+
+            # Reset button
+            if c3.button("Reset Selection"):
+                export_open = False
+                export_closed = False
+
+            export_df = filtered_df.copy()
+
+            # Apply filtering logic
+            if export_open and not export_closed:
+                export_df = export_df[export_df["Open"] > 0]
+
+            elif export_closed and not export_open:
+                export_df = export_df[export_df["Closed"] > 0]
+
+            # If both selected OR none selected → export all (no filter)
+
+            # -------- XML Conversion --------
+            def convert_df_to_xml(df):
+                root = ET.Element("TestSummary")
+
+                for _, row in df.iterrows():
+                    test_el = ET.SubElement(root, "Test")
+
+                    for col in df.columns:
+                        child = ET.SubElement(test_el, col.replace(" ", "_"))
+                        child.text = str(row[col])
+
+                return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+            xml_bytes = convert_df_to_xml(export_df)
+
+            # Dynamic filename
+            suffix = "all"
+            if export_open and not export_closed:
+                suffix = "open"
+            elif export_closed and not export_open:
+                suffix = "closed"
+
+            st.download_button(
+                label="⬇ Export XML",
+                data=xml_bytes,
+                file_name=f"test_summary_{current_prefix}_{suffix}.xml",
+                mime="application/xml",
+                use_container_width=True
+            )
+
+        else:
+            st.info("Test Summary is empty.")
+
+    except Exception as e:
+        st.warning("Test Summary sheet not found yet.")
