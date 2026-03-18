@@ -365,6 +365,7 @@ import io
 import datetime
 from pathlib import Path
 import unicodedata
+import time
 
 import plotly.express as px
 import plotly.graph_objects as go
@@ -393,6 +394,30 @@ st.markdown("""
 
 PROJECT_FOLDER = Path("project_reports")
 PROJECT_FOLDER.mkdir(exist_ok=True, parents=True)
+
+@st.cache_data
+def load_excel_cached(path, sheet):
+    return pd.read_excel(path, sheet_name=sheet)
+
+
+def show_progress():
+    progress_bar = st.progress(0)
+    status = st.empty()
+
+    steps = [
+        ("📂 Loading Excel file...", 20),
+        ("🧹 Cleaning data...", 40),
+        ("📊 Preparing summaries...", 60),
+        ("📈 Generating charts...", 80),
+        ("✅ Finalizing...", 100),
+    ]
+
+    for text, val in steps:
+        status.text(text)
+        progress_bar.progress(val)
+        time.sleep(0.2)
+
+    status.text("Done!")
 
 def list_existing_projects():
     files = PROJECT_FOLDER.glob("*_clash_report.xlsx")
@@ -468,7 +493,11 @@ def parse_xml(file_bytes: bytes, use_manual: bool, position: int | None):
     root = ET.parse(io.BytesIO(file_bytes)).getroot()
     rows = []
 
-    for test in root.iter("clashtest"):
+    # for test in root.iter("clashtest"):
+    tests = list(root.iter("clashtest"))
+    progress = st.progress(0)
+
+    for i, test in enumerate(tests):
         name = test.get("name")
         prio = test.get("priority")
         prefix = extract_prefix_position(name, position) if use_manual else extract_prefix_regex(name)
@@ -498,6 +527,7 @@ def parse_xml(file_bytes: bytes, use_manual: bool, position: int | None):
                     row[n] = v
 
             rows.append(row)
+        progress.progress((i + 1) / len(tests))
 
     return rows
 
@@ -844,17 +874,40 @@ if page == "Clash Dashboard":
 
     # project_input = st.text_input("Project name", value="MyProject")
 
-    
+    # path = get_project_filepath(project_input)
 
+    files = [
+        f for f in PROJECT_FOLDER.glob("*_clash_report.xlsx")
+        if not f.name.startswith("~$")
+    ]
 
+    if not files:
+        st.warning("No project files found. Upload XML first.")
+        st.stop()
 
-    path = get_project_filepath(project_input)
+    # Get latest file (most recently modified)
+    path = max(files, key=lambda x: x.stat().st_mtime)
+
 
     if not path.exists():
         st.warning("Project file not found. Upload XML first.")
         st.stop()
 
-    df = pd.read_excel(path, sheet_name="Clash_Details")
+    # df = pd.read_excel(path, sheet_name="Clash_Details")
+
+    # df = load_excel_cached(path, "Clash_Details")
+
+    start = time.time()
+
+    with st.spinner("Loading project data..."):
+        show_progress()
+
+        df = load_excel_cached(path, "Clash_Details")
+        # weekly_df = load_excel_cached(path, "Weekly_Progress")
+        test_df = load_excel_cached(path, "Test_Summary")
+
+    end = time.time()
+    st.caption(f"Loaded in {end - start:.2f} seconds")
 
     # Detect status column
     status_col = next((c for c in df.columns if "status" in str(c).lower()), None)
@@ -888,7 +941,8 @@ if page == "Clash Dashboard":
 
     try:
 
-        weekly_df = pd.read_excel(path, sheet_name="Weekly_Progress")
+        # weekly_df = pd.read_excel(path, sheet_name="Weekly_Progress")
+        weekly_df = load_excel_cached(path, "Weekly_Progress")
 
         if not weekly_df.empty:
 
@@ -1050,7 +1104,8 @@ if page == "Clash Dashboard":
     # ------------------------------
 
     try:
-        test_df = pd.read_excel(path, sheet_name="Test_Summary")
+        # test_df = pd.read_excel(path, sheet_name="Test_Summary")
+        # test_df = load_excel_cached(path, "Test_Summary")
 
         if not test_df.empty:
 
@@ -1116,7 +1171,7 @@ if page == "Clash Dashboard":
             #     use_container_width=True
             # )
 
-            # -------- Status Filter for Export --------
+            # -------- Export Section --------
             st.markdown("### Export Options")
 
             c1, c2, c3 = st.columns(3)
@@ -1138,7 +1193,7 @@ if page == "Clash Dashboard":
             elif export_closed and not export_open:
                 export_df = export_df[export_df["Closed"] > 0]
 
-            # If both selected OR none selected → export all (no filter)
+            # If both or none → export all
 
             # -------- XML Conversion --------
             def convert_df_to_xml(df):
@@ -1155,18 +1210,36 @@ if page == "Clash Dashboard":
 
             xml_bytes = convert_df_to_xml(export_df)
 
-            # Dynamic filename
+            # -------- Excel Conversion --------
+            excel_buffer = io.BytesIO()
+            with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+                export_df.to_excel(writer, index=False, sheet_name="Test_Summary")
+
+            excel_bytes = excel_buffer.getvalue()
+
+            # -------- Filename --------
             suffix = "all"
             if export_open and not export_closed:
                 suffix = "open"
             elif export_closed and not export_open:
                 suffix = "closed"
 
-            st.download_button(
+            # -------- Download Buttons --------
+            b1, b2 = st.columns(2)
+
+            b1.download_button(
                 label="⬇ Export XML",
                 data=xml_bytes,
                 file_name=f"test_summary_{current_prefix}_{suffix}.xml",
                 mime="application/xml",
+                use_container_width=True
+            )
+
+            b2.download_button(
+                label="⬇ Export Excel",
+                data=excel_bytes,
+                file_name=f"test_summary_{current_prefix}_{suffix}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True
             )
 
