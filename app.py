@@ -489,11 +489,64 @@ def extract_prefix_position(test_name, pos):
 
 # ── XML Parser ──────────────────────────────────────────────────────────────
 
+# def parse_xml(file_bytes: bytes, use_manual: bool, position: int | None):
+#     root = ET.parse(io.BytesIO(file_bytes)).getroot()
+#     rows = []
+
+#     # for test in root.iter("clashtest"):
+#     tests = list(root.iter("clashtest"))
+#     progress = st.progress(0)
+
+#     for i, test in enumerate(tests):
+#         name = test.get("name")
+#         prio = test.get("priority")
+#         prefix = extract_prefix_position(name, position) if use_manual else extract_prefix_regex(name)
+
+#         clashes = list(test.iter("clashresult")) or list(test.iter("clashgroup"))
+#         total = len(clashes)
+
+#         for clash in clashes:
+#             row = {
+#                 "Test Name": name,
+#                 "Prefix": prefix,
+#                 "Test Priority": prio,
+#                 "Total Clashes In Test": total,
+#             }
+
+#             # Extract LEVEL from clashgroup
+#             level_name = clash.get("name")
+
+#             # fallback: try parent (important for clashresult)
+#             if not level_name:
+#                 parent = clash.find("..")
+#                 if parent is not None:
+#                     level_name = parent.get("name")
+
+#             row["Level"] = level_name
+
+#             row.update({f"clash_{k}": v for k,v in clash.attrib.items()})
+
+#             for el in clash.iter():
+#                 if el.text and el.text.strip():
+#                     row[el.tag] = el.text.strip()
+#                 row.update({f"{el.tag}_{k}": v for k,v in el.attrib.items()})
+
+#             for oa in clash.findall(".//objectattribute"):
+#                 n = oa.findtext("name")
+#                 v = oa.findtext("value")
+#                 if n and v:
+#                     row[n] = v
+
+#             rows.append(row)
+#         progress.progress((i + 1) / len(tests))
+
+#     return rows
+
+
 def parse_xml(file_bytes: bytes, use_manual: bool, position: int | None):
     root = ET.parse(io.BytesIO(file_bytes)).getroot()
     rows = []
 
-    # for test in root.iter("clashtest"):
     tests = list(root.iter("clashtest"))
     progress = st.progress(0)
 
@@ -502,37 +555,73 @@ def parse_xml(file_bytes: bytes, use_manual: bool, position: int | None):
         prio = test.get("priority")
         prefix = extract_prefix_position(name, position) if use_manual else extract_prefix_regex(name)
 
-        clashes = list(test.iter("clashresult")) or list(test.iter("clashgroup"))
-        total = len(clashes)
+        total = 0
 
-        for clash in clashes:
-            row = {
-                "Test Name": name,
-                "Prefix": prefix,
-                "Test Priority": prio,
-                "Total Clashes In Test": total,
-            }
+        # 👉 iterate properly through groups
+        for clashgroup in test.findall(".//clashgroup"):
 
-            row.update({f"clash_{k}": v for k,v in clash.attrib.items()})
+            level_name = clashgroup.get("name")  # ✅ LEVEL comes from group
 
-            for el in clash.iter():
-                if el.text and el.text.strip():
-                    row[el.tag] = el.text.strip()
-                row.update({f"{el.tag}_{k}": v for k,v in el.attrib.items()})
+            clashes = clashgroup.findall(".//clashresult")
+            total += len(clashes)
 
-            for oa in clash.findall(".//objectattribute"):
-                n = oa.findtext("name")
-                v = oa.findtext("value")
-                if n and v:
-                    row[n] = v
+            for clash in clashes:
 
-            rows.append(row)
+                row = {
+                    "Test Name": name,
+                    "Prefix": prefix,
+                    "Test Priority": prio,
+                    "Level": level_name,  # ✅ always correct now
+                }
+
+                row.update({f"clash_{k}": v for k, v in clash.attrib.items()})
+
+                for el in clash.iter():
+                    if el.text and el.text.strip():
+                        row[el.tag] = el.text.strip()
+                    row.update({f"{el.tag}_{k}": v for k, v in el.attrib.items()})
+
+                for oa in clash.findall(".//objectattribute"):
+                    n = oa.findtext("name")
+                    v = oa.findtext("value")
+                    if n and v:
+                        row[n] = v
+
+                rows.append(row)
+
+        # fallback: if NO groups exist (rare case)
+        if total == 0:
+            clashes = list(test.findall(".//clashresult"))
+            total = len(clashes)
+
+            for clash in clashes:
+                row = {
+                    "Test Name": name,
+                    "Prefix": prefix,
+                    "Test Priority": prio,
+                    "Level": None,  # no level available
+                }
+
+                row.update({f"clash_{k}": v for k, v in clash.attrib.items()})
+
+                for el in clash.iter():
+                    if el.text and el.text.strip():
+                        row[el.tag] = el.text.strip()
+                    row.update({f"{el.tag}_{k}": v for k, v in el.attrib.items()})
+
+                rows.append(row)
+
         progress.progress((i + 1) / len(tests))
 
     return rows
 
 
 # ── Main Excel update logic ────────────────────────────────────────────────
+
+def clean_level(level):
+    if not level:
+        return None
+    return level.split("-")[0].strip()
 
 def update_project_file(df_new, project_input, open_cnt, closed_cnt):
     path = get_project_filepath(project_input)
@@ -555,6 +644,30 @@ def update_project_file(df_new, project_input, open_cnt, closed_cnt):
     # 3. Recalculate Status_Summary & Prefix_Summary from latest data
     status_summary = None
     prefix_summary = None
+
+    level_summary = None
+
+    if "Level" in combined_details.columns:
+
+        df_level = combined_details.copy()
+
+        # ✅ CLEAN LEVEL NAMES
+        df_level["Level"] = df_level["Level"].apply(clean_level)
+
+        # Remove empty levels
+        df_level = df_level[df_level["Level"].notna()]
+
+        level_summary = (
+            df_level.pivot_table(
+                index=["Prefix", "Test Name"],
+                columns="Level",
+                aggfunc="size",
+                fill_value=0
+            )
+            .reset_index()
+        )
+
+    
 
     status_col = next((c for c in combined_details.columns if "status" in str(c).lower()), None)
     if status_col:
@@ -699,13 +812,21 @@ def update_project_file(df_new, project_input, open_cnt, closed_cnt):
         # 5. Write all 4 sheets back
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
+
+            if level_summary is not None:
+                level_summary.to_excel(writer, sheet_name="Level_Summary", index=False)
+
             combined_details.to_excel(writer, sheet_name="Clash_Details", index=False)
+
             if status_summary is not None:
                 status_summary.to_excel(writer, sheet_name="Status_Summary", index=False)
+
             if prefix_summary is not None:
                 prefix_summary.to_excel(writer, sheet_name="Prefix_Summary", index=False)
+
             if test_summary is not None:
                 test_summary.to_excel(writer, sheet_name="Test_Summary", index=False)
+
             weekly_df.to_excel(writer, sheet_name="Weekly_Progress", index=False)
 
         bytes_data = output.getvalue()
@@ -1248,3 +1369,22 @@ if page == "Clash Dashboard":
 
     except Exception as e:
         st.warning("Test Summary sheet not found yet.")
+
+    # ------------------------------
+    # Level Summary UI (NEW)
+    # ------------------------------
+
+    try:
+        level_df = load_excel_cached(path, "Level_Summary")
+
+        if not level_df.empty:
+            st.divider()
+            st.subheader("🏢 Level Summary")
+
+            st.dataframe(level_df, use_container_width=True)
+
+        else:
+            st.info("Level Summary is empty.")
+
+    except Exception as e:
+        st.warning("Level Summary sheet not found yet.")
